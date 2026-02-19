@@ -100,14 +100,10 @@ while IFS='|' read PAN ENC_PAN; do
     ACCT_NUM=$(printf '%012d' $COUNT)
     ACCOUNT="${ACCT_NUM}                 "
 
-    # PAN encriptado con corchetes: [1:xxxxxx==]
-    # El encpan ya devuelve algo como "1:m36nHLG9NLeW5xa1XVqfTw=="
-    # Necesitamos envolverlo en corchetes si no los trae
-    case "$ENC_PAN" in
-        \[*) PAN_VALUE="$ENC_PAN" ;;           # Ya tiene corchetes
-        1:*) PAN_VALUE="[${ENC_PAN}]" ;;        # Agregar corchetes
-        *)   PAN_VALUE="[1:${ENC_PAN}]" ;;      # Agregar prefijo y corchetes
-    esac
+    # PAN encriptado sin corchetes, solo el valor cifrado
+    # encpan devuelve algo como "[1:m36nHLG9NLeW5xa1XVqfTw==]"
+    # Quitamos corchetes si los trae
+    PAN_VALUE=$(echo "$ENC_PAN" | tr -d '[]')
 
     # Padding del PAN a 49 chars (CHAR(49))
     PAN_LEN=${#PAN_VALUE}
