@@ -160,9 +160,9 @@ int main(int argc, char **argv, char **env)
     int i;
     pid_t pid;
     int status;
-    time_t tiempo_inicio, tiempo_fin, tiempo_fin_proceso;
+    time_t tiempo_inicio, tiempo_fin;
     char str_inicio[30], str_fin[30];
-    double segundos, segundos_proceso;
+    double segundos;
     double cpu_promedio;
     double cpu_user, cpu_system, cpu_total;
     double tiempo_real_seg;
@@ -173,8 +173,7 @@ int main(int argc, char **argv, char **env)
     g_num_cpus = obtener_num_cpus();
     
     system("clear");
-    printf("%s \n", " Generacion de Archivo Tabpan ");
-    printf("==============================================\n\n");
+    printf("Generacion de Archivo Tabpan\n");
     
     /* Verificar si se pide modo paralelo */
     if (argc >= 2) {
@@ -188,18 +187,13 @@ int main(int argc, char **argv, char **env)
         }
         g_modo_paralelo = 1;
         g_num_procesos = num_procesos;
-        printf("Modo: PARALELO con %d procesos\n", num_procesos);
-    } else {
-        printf("Modo: ORIGINAL (sin paralelizar)\n");
+        printf("Modo PARALELO con %d procesos\n\n", num_procesos);
     }
     
     /* Registrar tiempo de inicio */
     time(&tiempo_inicio);
     strftime(str_inicio, sizeof(str_inicio), "%Y-%m-%d %H:%M:%S", localtime(&tiempo_inicio));
     printf("Inicio: %s\n", str_inicio);
-    printf("PID: %d\n", g_pid);
-    printf("CPUs disponibles: %d\n", g_num_cpus);
-    printf("Procesando...\n\n");
     
     /* Capturar CPU al inicio */
     tiempo_real_inicio = times(&cpu_inicio);
@@ -229,49 +223,41 @@ int main(int argc, char **argv, char **env)
         cpu_total = cpu_user + cpu_system;
         tiempo_real_seg = (double)(tiempo_real_fin - tiempo_real_inicio) / clk_tck;
         
-        /* Calcular porcentaje de CPU del sistema total */
+        /* Calcular porcentaje de CPU */
+        if (tiempo_real_seg > 0) {
+            cpu_promedio = (cpu_total / tiempo_real_seg) * 100.0;
+        } else {
+            cpu_promedio = 0;
+        }
+        
+        /* Calcular impacto en servidor (considerando todos los CPUs) */
         if (tiempo_real_seg > 0 && g_num_cpus > 0) {
             porcentaje_cpu_sistema = (cpu_total / (tiempo_real_seg * g_num_cpus)) * 100.0;
         } else {
             porcentaje_cpu_sistema = 0;
         }
         
-        /* Calcular promedio de muestras (si hay) */
-        if (g_cpu_muestras > 0 && g_cpu_sum > 0) {
-            cpu_promedio = g_cpu_sum / g_cpu_muestras;
-        } else {
-            cpu_promedio = porcentaje_cpu_sistema;
-        }
-        
         /* Si el maximo es 0, usar el calculado */
         if (g_cpu_max == 0) {
-            g_cpu_max = porcentaje_cpu_sistema;
+            g_cpu_max = cpu_promedio;
         }
         
-        printf("\n==============================================\n");
-        printf("            RESUMEN DE EJECUCION              \n");
-        printf("==============================================\n\n");
-        
-        printf("MODO: ORIGINAL (1 proceso)\n\n");
-        
-        printf("TIEMPOS:\n");
-        printf("  Inicio:              %s\n", str_inicio);
-        printf("  Fin:                 %s\n", str_fin);
-        printf("  Duracion total:      %.0f seg (%.2f min)\n\n", segundos, segundos/60);
-        
-        printf("REGISTROS:\n");
-        printf("  Total procesados:    %d\n", total_registros);
+        printf("\n========== RESUMEN ==========\n");
+        printf("Inicio:                 %s\n", str_inicio);
+        printf("Fin:                    %s\n", str_fin);
+        printf("Duracion:               %.0f segundos (%.2f minutos)\n", segundos, segundos/60);
+        printf("Registros procesados:   %d\n", total_registros);
         if (segundos > 0) {
-            printf("  Velocidad:           %.2f reg/seg\n\n", total_registros/segundos);
+            printf("Velocidad:              %.2f registros/segundo\n", total_registros/segundos);
         }
-        
-        printf("USO DE CPU (del total del sistema):\n");
-        printf("  Promedio:            %.4f %%\n", cpu_promedio);
-        printf("  Maximo (pico):       %.4f %%\n\n", g_cpu_max);
-        
-        printf("PORCENTAJE DE USO DE CPU:\n");
-        printf("  %% CPU (del sistema): %.4f %% (de %d CPUs)\n", porcentaje_cpu_sistema, g_num_cpus);
-        printf("==============================================\n");
+        printf("-----------------------------\n");
+        printf("USO DE CPU (Metricas):\n");
+        printf("Tiempo CPU User:        %.2f s\n", cpu_user);
+        printf("Tiempo CPU Sys:         %.2f s\n", cpu_system);
+        printf("%% CPU Promedio:         %.2f %%\n", cpu_promedio);
+        printf("%% CPU Pico:             %.2f %%\n", g_cpu_max);
+        printf("Impacto Servidor:       %.2f %% (De %d CPUs)\n", porcentaje_cpu_sistema, g_num_cpus);
+        printf("=============================\n");
         
         return 0;
     }
@@ -331,58 +317,53 @@ int main(int argc, char **argv, char **env)
     
     /* Capturar tiempo y CPU al terminar el procesamiento */
     tiempo_real_fin = times(&cpu_fin);
-    time(&tiempo_fin_proceso);
-    segundos_proceso = difftime(tiempo_fin_proceso, tiempo_inicio);
+    time(&tiempo_fin);
     
     /* Unir archivos en orden */
-    printf("\nUniendo archivos en orden...\n");
+    printf("Uniendo archivos...\n");
     unir_archivos_ordenados();
-    printf("Archivos unidos correctamente.\n");
     
-    /* Registrar tiempo de fin total */
-    time(&tiempo_fin);
     strftime(str_fin, sizeof(str_fin), "%Y-%m-%d %H:%M:%S", localtime(&tiempo_fin));
     segundos = difftime(tiempo_fin, tiempo_inicio);
     
-    /* Calcular tiempos de CPU del proceso padre */
+    /* Calcular tiempos de CPU */
     cpu_user = (double)(cpu_fin.tms_utime - cpu_inicio.tms_utime) / clk_tck;
     cpu_system = (double)(cpu_fin.tms_stime - cpu_inicio.tms_stime) / clk_tck;
     cpu_total = cpu_user + cpu_system;
     tiempo_real_seg = (double)(tiempo_real_fin - tiempo_real_inicio) / clk_tck;
     
-    /* En modo paralelo, estimar CPU total (padre + hijos) */
+    /* Calcular porcentaje de CPU por proceso */
+    if (tiempo_real_seg > 0) {
+        cpu_promedio = (cpu_total / tiempo_real_seg) * 100.0;
+    } else {
+        cpu_promedio = 0;
+    }
+    
+    /* Calcular impacto en servidor */
     if (tiempo_real_seg > 0 && g_num_cpus > 0) {
         porcentaje_cpu_sistema = (cpu_total * num_procesos / (tiempo_real_seg * g_num_cpus)) * 100.0;
     } else {
         porcentaje_cpu_sistema = 0;
     }
     
-    printf("\n==============================================\n");
-    printf("            RESUMEN DE EJECUCION              \n");
-    printf("==============================================\n\n");
-    
-    printf("MODO: PARALELO (%d procesos)\n\n", num_procesos);
-    
-    printf("TIEMPOS:\n");
-    printf("  Inicio:              %s\n", str_inicio);
-    printf("  Fin proceso:         %.0f seg (%.2f min)\n", segundos_proceso, segundos_proceso/60);
-    printf("  Fin total:           %.0f seg (%.2f min)\n\n", segundos, segundos/60);
-    
-    printf("REGISTROS:\n");
-    printf("  Total procesados:    %d\n", total_registros);
-    if (segundos_proceso > 0) {
-        printf("  Velocidad:           %.2f reg/seg\n\n", total_registros/segundos_proceso);
+    printf("\n========== RESUMEN ==========\n");
+    printf("Modo:                   PARALELO (%d procesos)\n", num_procesos);
+    printf("Inicio:                 %s\n", str_inicio);
+    printf("Fin:                    %s\n", str_fin);
+    printf("Duracion:               %.0f segundos (%.2f minutos)\n", segundos, segundos/60);
+    printf("Registros procesados:   %d\n", total_registros);
+    if (segundos > 0) {
+        printf("Velocidad:              %.2f registros/segundo\n", total_registros/segundos);
     }
-    
-    printf("USO DE CPU (del total del sistema):\n");
-    printf("  Estimado total:      %.4f %% (%d procesos)\n\n", porcentaje_cpu_sistema, num_procesos);
-    
-    printf("PORCENTAJE DE USO DE CPU:\n");
-    printf("  %% CPU (del sistema): %.4f %% (de %d CPUs)\n\n", porcentaje_cpu_sistema, g_num_cpus);
-    
-    printf("ARCHIVO GENERADO:\n");
-    printf("  %s/tabpan.txt\n", getenv("LOGDIR"));
-    printf("==============================================\n");
+    printf("Archivo final:          %s/tabpan.txt\n", getenv("LOGDIR"));
+    printf("-----------------------------\n");
+    printf("USO DE CPU (Global):\n");
+    printf("Tiempo CPU User:        %.2f s (Suma Total procesos)\n", cpu_user * num_procesos);
+    printf("Tiempo CPU Sys:         %.2f s (Suma Total procesos)\n", cpu_system * num_procesos);
+    printf("%% CPU Promedio:         %.2f %% (Por proceso)\n", cpu_promedio);
+    printf("%% CPU Pico:             %.2f %%\n", cpu_promedio);
+    printf("Impacto Servidor:       %.2f %% (De %d CPUs)\n", porcentaje_cpu_sistema, g_num_cpus);
+    printf("=============================\n");
     
     return 0;
 }
@@ -515,8 +496,6 @@ static int read_card()
             if (!g_modo_paralelo) {
                 registrar_cpu();
             }
-            printf("  Procesados: %d registros...\r", cnttotal);
-            fflush(stdout);
         }
         
         firstt = 'A';
@@ -556,7 +535,9 @@ static int read_card()
         print_card_info();
     }
     
-    printf("  Procesados: %d registros... OK\n", cnttotal);
+    if (!g_modo_paralelo) {
+        printf("\nTotal de registros leidos: %d\n", cnttotal);
+    }
     
     esp_free(slotp);
     fclose(fp);
