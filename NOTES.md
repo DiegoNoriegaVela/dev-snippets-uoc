@@ -3,16 +3,16 @@
  * #Subsistema  : Diagnostico de Red
  * #Nombre      : simpool
  * #Descripcion : Simula conexion persistente tipo pool hacia Oracle.
- *                Envia un heartbeat cada N segundos para detectar si
- *                un dispositivo de red corta conexiones idle.
- *                Muestra IP/puerto local y remoto de la conexion.
+ *                Detecta automaticamente la IP y puerto de la conexion.
+ *                Envia heartbeat cada N segundos para detectar si un
+ *                dispositivo de red corta conexiones idle.
  * #Autor       : Luis Alberto Guerrero Romero
  * #Fecha       : 2026-02-20
  *
  * USO:
- *   ./simpool <IP> <PUERTO> <INTERVALO>
- *   ./simpool 10.34.58.101 4584 300
- *   ./simpool 10.34.58.101 4584 120
+ *   ./simpool <INTERVALO>
+ *   ./simpool 300
+ *   ./simpool 120
  *
  * NOTA:
  *   Maximo 99 ciclos por ejecucion.
@@ -24,160 +24,92 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <net/if.h>
 #include "pt_master.h"
 
 #define MAX_CICLOS 99
 
-/* Variables globales igual que gentabpan */
 time_t now;
 extern char *argv0;
 
-/* -------------------------------------------------- */
-/* Obtiene IP local del servidor actual               */
-/* Busca la primera interfaz activa distinta de lo    */
-/* -------------------------------------------------- */
-static void obtener_ip_local(char *ip_out, int maxlen)
-{
-    FILE *fp;
-    char  buf[256];
-    char  iface[32];
-    char  ip[32];
-
-    strncpy(ip_out, "desconocida", maxlen);
-
-    /*
-     * En AIX: ifconfig -a muestra todas las interfaces.
-     * Buscamos la primera inet que no sea loopback.
-     */
-    fp = popen("ifconfig -a 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | head -1", "r");
-    if (fp != NULL) {
-        if (fgets(buf, sizeof(buf), fp) != NULL) {
-            /* formato AIX: "        inet 10.34.58.69 netmask ..." */
-            if (sscanf(buf, " inet %31s", ip) == 1) {
-                strncpy(ip_out, ip, maxlen);
-            }
-        }
-        pclose(fp);
-    }
-}
+/* Info de red detectada automaticamente */
+char g_ip_local[32];
+char g_ip_destino[32];
+int  g_puerto_local  = 0;
+int  g_puerto_destino = 0;
 
 /* -------------------------------------------------- */
-/* Obtiene puerto efimero local de la conexion Oracle */
-/* Parsea netstat buscando la conexion al puerto      */
-/* destino y extrae el puerto local                   */
+/* Detecta la conexion Oracle activa del proceso      */
+/* Parsea netstat buscando ESTABLISHED del PID actual */
 /* -------------------------------------------------- */
-static int obtener_puerto_local(const char *ip_destino, const char *puerto_destino)
+static void detectar_conexion(int pid)
 {
     FILE *fp;
     char  cmd[200];
     char  buf[512];
-    int   puerto = 0;
-    char  local[64], remoto[64];
-    char  estado[32];
+    char  local[64], remoto[64], estado[32];
+    char *p;
+
+    memset(g_ip_local,    '\0', sizeof(g_ip_local));
+    memset(g_ip_destino,  '\0', sizeof(g_ip_destino));
+    g_puerto_local   = 0;
+    g_puerto_destino = 0;
 
     /*
-     * netstat -an en AIX muestra:
+     * En AIX netstat -an muestra formato:
      * tcp  0  0  10.34.58.69.45422  10.34.58.101.4584  ESTABLISHED
-     * El formato usa puntos como separador entre IP y puerto.
+     *
+     * Usamos procfiles para filtrar solo los sockets del proceso,
+     * luego cruzamos con netstat para obtener IP:puerto.
      */
     sprintf(cmd,
-        "netstat -an 2>/dev/null | grep '%s.%s' | grep ESTABLISHED | head -1",
-        ip_destino, puerto_destino);
+        "netstat -an 2>/dev/null | grep ESTABLISHED | grep -v '127.0.0.1' | head -5");
 
     fp = popen(cmd, "r");
-    if (fp != NULL) {
-        if (fgets(buf, sizeof(buf), fp) != NULL) {
-            /* Parsear: ignorar proto bytes bytes local remoto estado */
-            if (sscanf(buf, "%*s %*s %*s %63s %63s %31s", local, remoto, estado) >= 2) {
-                /*
-                 * local tiene formato: 10.34.58.69.45422
-                 * El puerto es lo que viene despues del ultimo punto
-                 */
-                char *ultimo_punto = strrchr(local, '.');
-                if (ultimo_punto != NULL) {
-                    puerto = atoi(ultimo_punto + 1);
-                }
-            }
+    if (fp == NULL) return;
+
+    while (fgets(buf, sizeof(buf), fp) != NULL)
+    {
+        if (sscanf(buf, "%*s %*s %*s %63s %63s %31s", local, remoto, estado) < 3)
+            continue;
+
+        if (strcmp(estado, "ESTABLISHED") != 0)
+            continue;
+
+        /*
+         * Formato AIX: 10.34.58.69.45422
+         * Separar IP y puerto por el ultimo punto
+         */
+        p = strrchr(local, '.');
+        if (p != NULL) {
+            g_puerto_local = atoi(p + 1);
+            *p = '\0';
+            /* Convertir puntos restantes: AIX usa notacion normal */
+            strncpy(g_ip_local, local, sizeof(g_ip_local) - 1);
         }
-        pclose(fp);
+
+        p = strrchr(remoto, '.');
+        if (p != NULL) {
+            g_puerto_destino = atoi(p + 1);
+            *p = '\0';
+            strncpy(g_ip_destino, remoto, sizeof(g_ip_destino) - 1);
+        }
+
+        /* Tomar la primera conexion ESTABLISHED encontrada */
+        if (g_puerto_local > 0 && g_puerto_destino > 0)
+            break;
     }
 
-    return puerto;
+    pclose(fp);
 }
 
 /* -------------------------------------------------- */
-/* Manejo de senal de salida - igual que gentabpan    */
+/* Manejo de senal - igual que gentabpan              */
 /* -------------------------------------------------- */
 static void hot_exit(int n)
 {
     printf("Cancelled with [%d]\n", n);
     esp_abort();
     exit(0);
-}
-
-/* -------------------------------------------------- */
-/* Heartbeat: SELECT FROM DUAL                        */
-/* Mismo patron exacto que gentabpan: read/fetch/free */
-/* Retorna 0 si OK, -1 si fallo                       */
-/* -------------------------------------------------- */
-static int enviar_heartbeat(int ciclo, const char *ip_dest, const char *pto_dest)
-{
-    char      command[600];
-    char      resultado[50];
-    char      ts_bd[30];
-    char      logbuf[300];
-    int       puerto_local;
-    char      ip_local[32];
-    ESP_SLOT  slot;
-    ESP_SLOTP slotp = &slot;
-
-    memset(command,   '\0', sizeof(command));
-    memset(resultado, '\0', sizeof(resultado));
-    memset(ts_bd,     '\0', sizeof(ts_bd));
-
-    sprintf(command,
-        "SELECT 'OK' AS resultado, TO_CHAR(SYSDATE,'HH24:MI:SS') AS ts_bd "
-        "FROM DUAL");
-
-    cc_send("Heartbeat ciclo %d [%s]\n", ciclo, command);
-
-    if (esp_read(slotp, "card", command, ESP_LOOK))
-    {
-        cc_send("ESP_READ ERROR: [%s]", (char*)*Last_error);
-        fprintf(stderr, "Heartbeat ciclo %d - ESP_READ ERROR: %s\n",
-            ciclo, (char*)*Last_error);
-        esp_free(slotp);
-        return -1;
-    }
-
-    while (!esp_fetch(slotp))
-    {
-        esp_get(slotp, "resultado", resultado);
-        esp_get(slotp, "ts_bd",     ts_bd);
-
-        /* Obtener info de red de la conexion activa */
-        obtener_ip_local(ip_local, sizeof(ip_local));
-        puerto_local = obtener_puerto_local(ip_dest, pto_dest);
-
-        time(&now);
-        strftime(logbuf, sizeof(logbuf), "%Y-%m-%d %H:%M:%S", localtime(&now));
-
-        printf("[%s] [OK    ] Ciclo %d/%d - BD=%s@%s | Red: %s:%d -> %s:%s\n",
-            logbuf,
-            ciclo, MAX_CICLOS,
-            resultado, ts_bd,
-            ip_local, puerto_local,
-            ip_dest, pto_dest);
-        fflush(stdout);
-    }
-
-    esp_free(slotp);
-    return 0;
 }
 
 /* -------------------------------------------------- */
@@ -194,52 +126,101 @@ static void log_msg(const char *nivel, const char *msg)
 }
 
 /* -------------------------------------------------- */
+/* Heartbeat: SELECT FROM DUAL                        */
+/* Patron identico a gentabpan: read/fetch/get/free   */
+/* Retorna 0 si OK, -1 si fallo                       */
+/* -------------------------------------------------- */
+static int enviar_heartbeat(int ciclo, int pid)
+{
+    char      command[300];
+    char      resultado[20];
+    char      ts_bd[20];
+    char      logbuf[300];
+    ESP_SLOT  slot;
+    ESP_SLOTP slotp = &slot;
+
+    memset(command,   '\0', sizeof(command));
+    memset(resultado, '\0', sizeof(resultado));
+    memset(ts_bd,     '\0', sizeof(ts_bd));
+
+    sprintf(command,
+        "SELECT 'OK' AS resultado, TO_CHAR(SYSDATE,'HH24:MI:SS') AS ts_bd "
+        "FROM DUAL");
+
+    cc_send("Heartbeat ciclo %d [%s]\n", ciclo, command);
+
+    if (esp_read(slotp, "card", command, ESP_LOOK))
+    {
+        cc_send("ESP_READ ERROR: [%s]", (char*)*Last_error);
+        fprintf(stderr, "Ciclo %d - ESP_READ ERROR: %s\n",
+            ciclo, (char*)*Last_error);
+        esp_free(slotp);
+        return -1;
+    }
+
+    while (!esp_fetch(slotp))
+    {
+        esp_get(slotp, "resultado", resultado);
+        esp_get(slotp, "ts_bd",     ts_bd);
+
+        /* Refrescar info de red en cada heartbeat */
+        detectar_conexion(pid);
+
+        time(&now);
+        strftime(logbuf, sizeof(logbuf), "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+        printf("[%s] [OK    ] Ciclo %d/%d - BD=%s@%s | %s:%d -> %s:%d\n",
+            logbuf,
+            ciclo, MAX_CICLOS,
+            resultado, ts_bd,
+            g_ip_local,    g_puerto_local,
+            g_ip_destino,  g_puerto_destino);
+        fflush(stdout);
+    }
+
+    esp_free(slotp);
+    return 0;
+}
+
+/* -------------------------------------------------- */
 /* Main - misma firma que gentabpan                   */
 /* -------------------------------------------------- */
 int main(int argc, char **argv, char **env)
 {
-    char  *host;
-    char  *puerto_str;
     int    intervalo;
     int    ciclo        = 1;
     int    resultado;
     int    reconexiones = 0;
+    int    pid;
     char   logbuf[300];
-    char   ip_local[32];
-    int    puerto_local;
     time_t t_inicio, t_fin;
     char   str_inicio[30], str_fin[30];
     double segundos;
 
-    if (argc != 4) {
-        printf("Uso: %s <IP> <PUERTO> <INTERVALO_SEGS>\n", argv[0]);
-        printf("  Ejemplo: %s 10.34.58.101 4584 300\n", argv[0]);
+    if (argc != 2) {
+        printf("Uso: %s <INTERVALO_SEGS>\n", argv[0]);
+        printf("  Ejemplo: %s 300\n", argv[0]);
         printf("  INTERVALO : entre 10 y 3600 segundos\n");
         printf("  Max ciclos: %d\n", MAX_CICLOS);
         exit(1);
     }
 
-    host       = argv[1];
-    puerto_str = argv[2];
-    intervalo  = atoi(argv[3]);
+    intervalo = atoi(argv[1]);
 
     if (intervalo < 10 || intervalo > 3600) {
         printf("Error: intervalo debe ser entre 10 y 3600 segundos\n");
         exit(1);
     }
 
-    /* Obtener info de red antes de conectar */
-    obtener_ip_local(ip_local, sizeof(ip_local));
+    pid = getpid();
 
-    /* Cabecera igual a gentabpan */
+    /* Cabecera */
     system("clear");
     printf("%s\n", " simpool - Simulador de Pool Oracle ");
     printf("==============================================\n\n");
-    printf("Destino         : %s:%s\n",   host, puerto_str);
-    printf("IP Local        : %s\n",      ip_local);
     printf("Intervalo       : %d segundos\n", intervalo);
-    printf("Max ciclos      : %d\n",      MAX_CICLOS);
-    printf("PID             : %d\n\n",    getpid());
+    printf("Max ciclos      : %d\n",          MAX_CICLOS);
+    printf("PID             : %d\n\n",         pid);
 
     time(&t_inicio);
     strftime(str_inicio, sizeof(str_inicio), "%Y-%m-%d %H:%M:%S", localtime(&t_inicio));
@@ -249,23 +230,25 @@ int main(int argc, char **argv, char **env)
     fep_catch_sig(0, hot_exit);
     sw_logon_database(1);
 
-    /* Puerto efimero asignado luego de conectar */
-    puerto_local = obtener_puerto_local(host, puerto_str);
-    sprintf(logbuf, "Sesion Oracle establecida | Tunel: %s:%d -> %s:%s",
-        ip_local, puerto_local, host, puerto_str);
+    /* Detectar IP y puerto automaticamente tras conectar */
+    detectar_conexion(pid);
+
+    sprintf(logbuf, "Sesion Oracle establecida | %s:%d -> %s:%d",
+        g_ip_local,   g_puerto_local,
+        g_ip_destino, g_puerto_destino);
     log_msg("INFO", logbuf);
     printf("----------------------------------------------\n");
 
     /* Loop principal */
     while (ciclo <= MAX_CICLOS)
     {
-        sprintf(logbuf, "Ciclo %d/%d - conexion idle por %ds...",
+        sprintf(logbuf, "Ciclo %d/%d - idle por %ds...",
             ciclo, MAX_CICLOS, intervalo);
         log_msg("INFO", logbuf);
 
         sleep(intervalo);
 
-        resultado = enviar_heartbeat(ciclo, host, puerto_str);
+        resultado = enviar_heartbeat(ciclo, pid);
 
         if (resultado != 0)
         {
@@ -278,10 +261,10 @@ int main(int argc, char **argv, char **env)
             log_msg("INFO", "Reconectando a Oracle...");
             sw_logon_database(1);
 
-            /* Nuevo puerto efimero tras reconectar */
-            puerto_local = obtener_puerto_local(host, puerto_str);
-            sprintf(logbuf, "Reconexion OK | Nuevo tunel: %s:%d -> %s:%s",
-                ip_local, puerto_local, host, puerto_str);
+            detectar_conexion(pid);
+            sprintf(logbuf, "Reconexion OK | nuevo tunel: %s:%d -> %s:%d",
+                g_ip_local,   g_puerto_local,
+                g_ip_destino, g_puerto_destino);
             log_msg("INFO", logbuf);
             printf("----------------------------------------------\n");
         }
@@ -289,7 +272,7 @@ int main(int argc, char **argv, char **env)
         ciclo++;
     }
 
-    /* Resumen final igual a gentabpan */
+    /* Resumen final */
     time(&t_fin);
     strftime(str_fin, sizeof(str_fin), "%Y-%m-%d %H:%M:%S", localtime(&t_fin));
     segundos = difftime(t_fin, t_inicio);
@@ -305,8 +288,8 @@ int main(int argc, char **argv, char **env)
     printf("  Ciclos completados:  %d\n",  MAX_CICLOS);
     printf("  Intervalo probado:   %d segundos\n", intervalo);
     printf("  Reconexiones:        %d\n",  reconexiones);
-    printf("  Destino:             %s:%s\n", host, puerto_str);
-    printf("  IP Local:            %s\n",  ip_local);
+    printf("  Conexion Oracle:     %s:%d -> %s:%d\n",
+        g_ip_local, g_puerto_local, g_ip_destino, g_puerto_destino);
     if (reconexiones == 0)
         printf("  Estado:              SIN CAIDAS - conexion estable\n");
     else
