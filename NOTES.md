@@ -11,7 +11,7 @@
  * #Fecha       : 2026-02-20
  *
  * COMPILACION:
- *   make -f Makefile.simpool
+ *   make
  *
  * USO:
  *   ./simpool <IP> <PUERTO> [INTERVALO]
@@ -19,9 +19,8 @@
  *   ./simpool 10.34.58.101 4584 120
  *
  * NOTA:
+ *   Maximo 99 ciclos por ejecucion.
  *   Si INTERVALO no se especifica, usa 300 segundos por defecto.
- *   Bajar el intervalo progresivamente para encontrar el umbral
- *   exacto del timeout del dispositivo de red.
  */
 
 #include <stdio.h>
@@ -37,8 +36,8 @@
 #include <arpa/inet.h>
 
 #define INTERVALO_DEFAULT  300
-#define TIMEOUT_CONEXION   10    /* segundos para establecer conexion */
-#define TIMEOUT_RECV       5     /* segundos para esperar respuesta   */
+#define TIMEOUT_RECV       5
+#define MAX_CICLOS         99
 
 /* -------------------------------------------------- */
 /* Log a pantalla con timestamp                       */
@@ -66,7 +65,6 @@ static int conectar(const char *host, int puerto)
     char logbuf[200];
     int optval = 1;
 
-    /* Crear socket */
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
         sprintf(logbuf, "Error creando socket: %s", strerror(errno));
@@ -74,18 +72,14 @@ static int conectar(const char *host, int puerto)
         return -1;
     }
 
-    /* Timeout de recv para detectar socket muerto */
     tv.tv_sec  = TIMEOUT_RECV;
     tv.tv_usec = 0;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
-
-    /* Activar TCP keepalive del sistema operativo */
     setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (char*)&optval, sizeof(optval));
 
-    /* Armar direccion destino */
     memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family      = AF_INET;
-    serv_addr.sin_port        = htons(puerto);
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port   = htons(puerto);
 
     if (inet_aton(host, &serv_addr.sin_addr) == 0) {
         sprintf(logbuf, "IP invalida: %s", host);
@@ -94,7 +88,6 @@ static int conectar(const char *host, int puerto)
         return -1;
     }
 
-    /* Conectar */
     if (connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
         sprintf(logbuf, "No se pudo conectar a %s:%d -> %s", host, puerto, strerror(errno));
         log_msg("ERROR", logbuf);
@@ -107,7 +100,6 @@ static int conectar(const char *host, int puerto)
 
 /* -------------------------------------------------- */
 /* Verifica si el socket sigue vivo                   */
-/* Intenta escribir un byte y leer la respuesta       */
 /* Retorna 0 si OK, -1 si la conexion esta muerta     */
 /* -------------------------------------------------- */
 static int verificar_socket(int sockfd, int ciclo)
@@ -116,30 +108,22 @@ static int verificar_socket(int sockfd, int ciclo)
     int n;
     char logbuf[200];
 
-    /* Enviar byte de prueba */
     buf[0] = '\x00';
     n = write(sockfd, buf, 1);
     if (n < 0) {
-        sprintf(logbuf, "Ciclo %d - write fallo: %s (conexion cortada por red)", ciclo, strerror(errno));
+        sprintf(logbuf, "Ciclo %d - write fallo: %s", ciclo, strerror(errno));
         log_msg("ALERTA", logbuf);
         return -1;
     }
 
-    /*
-     * Intentar leer respuesta con timeout.
-     * Oracle no responde a bytes nulos pero si el socket fue
-     * reseteado por el firewall, recv retorna error inmediatamente.
-     * Si hace timeout, el socket sigue vivo (silencio esperado de Oracle).
-     */
     n = recv(sockfd, buf, sizeof(buf), 0);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            /* Timeout de recv: Oracle no respondio pero socket vivo */
-            sprintf(logbuf, "Ciclo %d - socket activo (Oracle no responde al byte nulo, esperado)", ciclo);
+            /* Timeout: Oracle no respondio al byte nulo, socket vivo */
+            sprintf(logbuf, "Ciclo %d - socket activo", ciclo);
             log_msg("OK", logbuf);
             return 0;
         }
-        /* Error real: conexion muerta */
         sprintf(logbuf, "Ciclo %d - recv fallo: %s (conexion cortada)", ciclo, strerror(errno));
         log_msg("ALERTA", logbuf);
         return -1;
@@ -161,21 +145,21 @@ static int verificar_socket(int sockfd, int ciclo)
 /* -------------------------------------------------- */
 int main(int argc, char **argv)
 {
-    char      *host;
-    int        puerto;
-    int        intervalo = INTERVALO_DEFAULT;
-    int        sockfd    = -1;
-    int        ciclo     = 1;
-    int        resultado;
-    int        reconexiones = 0;
-    char       logbuf[200];
-    time_t     t_inicio;
+    char  *host;
+    int    puerto;
+    int    intervalo   = INTERVALO_DEFAULT;
+    int    sockfd      = -1;
+    int    ciclo       = 1;
+    int    resultado;
+    int    reconexiones = 0;
+    char   logbuf[200];
+    time_t t_inicio;
 
-    /* Validar argumentos */
     if (argc < 3) {
         printf("Uso: %s <IP> <PUERTO> [INTERVALO_SEGS]\n", argv[0]);
         printf("  Ejemplo: %s 10.34.58.101 4584 300\n", argv[0]);
         printf("  INTERVALO por defecto: %d segundos\n", INTERVALO_DEFAULT);
+        printf("  Maximo de ciclos     : %d\n", MAX_CICLOS);
         exit(1);
     }
 
@@ -199,15 +183,14 @@ int main(int argc, char **argv)
     printf("  simpool - Simulador de Pool TCP\n");
     printf("  Destino  : %s:%d\n", host, puerto);
     printf("  Intervalo: %d segundos\n", intervalo);
-    printf("  Ctrl+C para salir\n");
+    printf("  Max ciclos: %d\n", MAX_CICLOS);
+    printf("  Ctrl+C para salir antes\n");
     printf("==============================================\n\n");
 
     time(&t_inicio);
 
-    /* Loop principal: conectar -> idle -> verificar -> repetir */
-    while (1) {
+    while (ciclo <= MAX_CICLOS) {
 
-        /* Conectar si no hay socket activo */
         if (sockfd < 0) {
             sprintf(logbuf, "Conectando a %s:%d... (reconexion #%d)", host, puerto, reconexiones);
             log_msg("INFO", logbuf);
@@ -224,19 +207,16 @@ int main(int argc, char **argv)
             log_msg("INFO", logbuf);
         }
 
-        /* Dejar la conexion idle N segundos (igual que un pool real) */
-        sprintf(logbuf, "Ciclo %d - conexion idle por %ds...", ciclo, intervalo);
+        sprintf(logbuf, "Ciclo %d/%d - idle por %ds...", ciclo, MAX_CICLOS, intervalo);
         log_msg("INFO", logbuf);
         sleep(intervalo);
 
-        /* Verificar si el socket sobrevivio el idle */
         resultado = verificar_socket(sockfd, ciclo);
 
         if (resultado != 0) {
-            /* Conexion muerta: cerrar y reconectar en siguiente iteracion */
             sprintf(logbuf,
-                ">>> CONEXION CAIDA en ciclo %d tras %ds idle | Total reconexiones: %d",
-                ciclo, intervalo, ++reconexiones);
+                ">>> CONEXION CAIDA en ciclo %d/%d tras %ds idle | Reconexiones: %d",
+                ciclo, MAX_CICLOS, intervalo, ++reconexiones);
             log_msg("ALERTA", logbuf);
 
             close(sockfd);
@@ -246,33 +226,44 @@ int main(int argc, char **argv)
         ciclo++;
     }
 
+    /* Resumen final */
+    printf("\n==============================================\n");
+    printf("  RESUMEN FINAL\n");
+    printf("  Ciclos completados : %d\n", MAX_CICLOS);
+    printf("  Reconexiones       : %d\n", reconexiones);
+    printf("  Intervalo probado  : %d segundos\n", intervalo);
+    if (reconexiones == 0)
+        printf("  Resultado          : SIN CAIDAS - conexion estable\n");
+    else
+        printf("  Resultado          : INESTABLE - revisar dispositivo de red\n");
+    printf("==============================================\n");
+
+    if (sockfd >= 0) close(sockfd);
     return 0;
 }
+
 
 # ==============================================
 # Makefile.simpool
 # Compilacion de simpool para AIX
 #
 # Uso:
-#   make -f Makefile.simpool        -> compila
-#   make -f Makefile.simpool clean  -> limpia binario
+#   make        -> compila
+#   make clean  -> limpia binario
 # ==============================================
 
 CC      = cc
-CFLAGS  = -O2 -q64
-LIBS    = -lsocket
+CFLAGS  = -O2 -q64 -W "l,suppress=1500-010"
 TARGET  = simpool
 SRC     = simpool.c
 
-# Compilacion principal
 $(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRC) $(LIBS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SRC)
 	@echo ""
 	@echo "Compilacion exitosa: ./$(TARGET)"
 	@echo "Uso: ./$(TARGET) <IP> <PUERTO> [INTERVALO]"
 	@echo "Ej:  ./$(TARGET) 10.34.58.101 4584 300"
 
-# Limpiar binario
 clean:
 	rm -f $(TARGET)
 
