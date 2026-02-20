@@ -26,21 +26,11 @@
 #include <signal.h>
 #include "pt_master.h"
 
-#define MAX_CICLOS 99
+#define MAX_CICLOS      99
+#define TIMEOUT_HB      30    /* segundos esperando respuesta del heartbeat */
 
 time_t now;
 extern char *argv0;
-
-/* Flag que activa el heartbeat cuando vence el alarma */
-volatile int g_alarma_vencida = 0;
-
-/* -------------------------------------------------- */
-/* Handler de SIGALRM: marca que vencio el intervalo  */
-/* -------------------------------------------------- */
-static void handler_alarma(int n)
-{
-    g_alarma_vencida = 1;
-}
 
 /* -------------------------------------------------- */
 /* Cierre limpio al recibir Ctrl+C                    */
@@ -56,12 +46,12 @@ static void hot_exit(int n)
     if (n == SIGINT)
         printf("\n[%s] [INFO  ] Ctrl+C recibido. Cerrando sesion Oracle...\n", ts);
     else
-        printf("\n[%s] [INFO  ] Senal %d recibida. Cerrando sesion Oracle...\n", ts, n);
+        printf("\n[%s] [INFO  ] Senal %d recibida. Cerrando...\n", ts, n);
 
     fflush(stdout);
-    alarm(0);       /* Cancelar alarma pendiente */
+    alarm(0);
     esp_abort();
-    printf("[%s] [INFO  ] Sesion cerrada correctamente. Saliendo.\n", ts);
+    printf("[%s] [INFO  ] Sesion cerrada. Saliendo.\n", ts);
     fflush(stdout);
     exit(0);
 }
@@ -80,18 +70,57 @@ static void log_msg(const char *nivel, const char *msg)
 }
 
 /* -------------------------------------------------- */
-/* Idle preciso usando SIGALRM                        */
-/* A diferencia de sleep(), alarm() no se ve afectado */
-/* por senales internas del framework ESP             */
+/* Idle usando sleep en chunks de 1 segundo           */
+/* Mas confiable que alarm() con frameworks ESP       */
+/* Muestra cuenta regresiva cada 60 segundos          */
 /* -------------------------------------------------- */
-static void idle_preciso(int segundos)
+static void idle_con_progreso(int intervalo, int ciclo)
 {
-    g_alarma_vencida = 0;
-    alarm(segundos);
+    int restante = intervalo;
+    char logbuf[200];
 
-    /* Esperar hasta que la alarma dispare */
-    while (!g_alarma_vencida)
-        pause();   /* pause() espera cualquier senal */
+    while (restante > 0) {
+        /* Mostrar progreso cada 60s o al inicio */
+        if (restante == intervalo || restante % 60 == 0) {
+            sprintf(logbuf, "Ciclo %d/%d - faltan %ds...",
+                ciclo, MAX_CICLOS, restante);
+            log_msg("WAIT  ", logbuf);
+        }
+        sleep(1);
+        restante--;
+    }
+}
+
+/* -------------------------------------------------- */
+/* Valida que la reconexion fue exitosa               */
+/* Retorna 0 si OK, -1 si fallo                       */
+/* -------------------------------------------------- */
+static int validar_reconexion()
+{
+    char      command[100];
+    char      resultado[20];
+    ESP_SLOT  slot;
+    ESP_SLOTP slotp = &slot;
+
+    memset(command,   '\0', sizeof(command));
+    memset(resultado, '\0', sizeof(resultado));
+
+    sprintf(command, "SELECT 'OK' AS resultado FROM DUAL");
+
+    if (esp_read(slotp, "validacion", command, ESP_LOOK)) {
+        esp_free(slotp);
+        return -1;
+    }
+
+    while (!esp_fetch(slotp))
+        esp_get(slotp, "resultado", resultado);
+
+    esp_free(slotp);
+
+    if (strcmp(resultado, "OK") == 0)
+        return 0;
+
+    return -1;
 }
 
 /* -------------------------------------------------- */
@@ -144,6 +173,36 @@ static int enviar_heartbeat(int ciclo)
 }
 
 /* -------------------------------------------------- */
+/* Reconexion con validacion                          */
+/* Retorna 0 si reconecto OK, -1 si fallo             */
+/* -------------------------------------------------- */
+static int reconectar(int intento)
+{
+    char logbuf[200];
+    int  max_reintentos = 3;
+    int  i;
+
+    for (i = 1; i <= max_reintentos; i++) {
+        sprintf(logbuf, "Reconexion intento %d/%d...", i, max_reintentos);
+        log_msg("INFO", logbuf);
+
+        sw_logon_database(1);
+
+        /* Validar que la sesion realmente quedo activa */
+        if (validar_reconexion() == 0) {
+            log_msg("INFO", "Reconexion validada exitosamente.");
+            return 0;
+        }
+
+        log_msg("ERROR", "Reconexion fallo en validacion. Reintentando en 5s...");
+        sleep(5);
+    }
+
+    log_msg("ERROR", "No se pudo reconectar tras 3 intentos.");
+    return -1;
+}
+
+/* -------------------------------------------------- */
 /* Main - misma firma que gentabpan                   */
 /* -------------------------------------------------- */
 int main(int argc, char **argv, char **env)
@@ -172,7 +231,7 @@ int main(int argc, char **argv, char **env)
         exit(1);
     }
 
-    /* Cabecera igual a gentabpan */
+    /* Cabecera */
     system("clear");
     printf("%s\n", " simpool - Simulador de Pool Oracle ");
     printf("==============================================\n\n");
@@ -184,30 +243,31 @@ int main(int argc, char **argv, char **env)
     strftime(str_inicio, sizeof(str_inicio), "%Y-%m-%d %H:%M:%S", localtime(&t_inicio));
     printf("Inicio          : %s\n\n", str_inicio);
 
-    /* Registrar senales */
-    fep_catch_sig(0, hot_exit);
+    /* Senales - ANTES de fep_catch_sig para que no las pise */
     signal(SIGINT,  hot_exit);
     signal(SIGTERM, hot_exit);
-    signal(SIGALRM, handler_alarma);   /* Para el idle preciso */
+    fep_catch_sig(0, hot_exit);
 
     sw_logon_database(1);
 
-    log_msg("INFO", "Sesion Oracle establecida. Iniciando ciclos de heartbeat.");
+    /* Validar conexion inicial */
+    if (validar_reconexion() != 0) {
+        log_msg("ERROR", "No se pudo establecer sesion Oracle inicial.");
+        exit(1);
+    }
+
+    log_msg("INFO", "Sesion Oracle establecida y validada. Iniciando ciclos.");
     printf("----------------------------------------------\n");
 
     /* Loop principal */
     while (ciclo <= MAX_CICLOS)
     {
-        sprintf(logbuf, "Ciclo %d/%d - idle por %ds...",
+        sprintf(logbuf, "Ciclo %d/%d - iniciando idle de %ds...",
             ciclo, MAX_CICLOS, intervalo);
         log_msg("INFO", logbuf);
 
-        /*
-         * idle_preciso usa SIGALRM en lugar de sleep().
-         * Garantiza que el heartbeat se ejecute exactamente
-         * a los N segundos sin importar senales del framework.
-         */
-        idle_preciso(intervalo);
+        /* Idle con progreso cada 60s */
+        idle_con_progreso(intervalo, ciclo);
 
         resultado = enviar_heartbeat(ciclo);
 
@@ -219,19 +279,22 @@ int main(int argc, char **argv, char **env)
             log_msg("ALERTA", logbuf);
 
             printf("----------------------------------------------\n");
-            log_msg("INFO", "Reconectando a Oracle...");
-            sw_logon_database(1);
-            log_msg("INFO", "Reconexion exitosa. Continuando...");
+
+            if (reconectar(reconexiones) != 0) {
+                log_msg("ERROR", "Reconexion fallida. Abortando.");
+                esp_abort();
+                exit(1);
+            }
+
             printf("----------------------------------------------\n");
         }
 
         ciclo++;
     }
 
-    /* Cancelar alarma pendiente al terminar */
     alarm(0);
 
-    /* Resumen final igual a gentabpan */
+    /* Resumen final */
     time(&t_fin);
     strftime(str_fin, sizeof(str_fin), "%Y-%m-%d %H:%M:%S", localtime(&t_fin));
     segundos = difftime(t_fin, t_inicio);
