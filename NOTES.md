@@ -3,16 +3,10 @@
  * #Subsistema  : Diagnostico de Red
  * #Nombre      : simpool
  * #Descripcion : Simula conexion persistente tipo pool hacia Oracle.
- *                Usa la misma infraestructura de conexion del proyecto
- *                (sw_logon_database / esp_read) para establecer una
- *                sesion Oracle real y enviar un heartbeat cada N segundos.
- *                Objetivo: detectar si un dispositivo de red corta
- *                conexiones idle antes del intervalo configurado.
+ *                Envia un heartbeat cada N segundos para detectar si
+ *                un dispositivo de red corta conexiones idle.
  * #Autor       : Luis Alberto Guerrero Romero
  * #Fecha       : 2026-02-20
- *
- * COMPILACION:
- *   make -f Makefile.simpool
  *
  * USO:
  *   ./simpool <IP> <PUERTO> <INTERVALO>
@@ -31,63 +25,70 @@
 #include <unistd.h>
 #include "pt_master.h"
 
-#define MAX_CICLOS  99
+#define MAX_CICLOS 99
+
+/* Variables globales igual que gentabpan */
+time_t now;
+extern char *argv0;
+
+/* Variables del heartbeat */
+char hb_account[30];
+char hb_pan[50];
 
 /* -------------------------------------------------- */
-/* Log a pantalla con timestamp                       */
+/* Manejo de señal de salida - igual que gentabpan    */
 /* -------------------------------------------------- */
-static void log_msg(const char *nivel, const char *msg)
+static void hot_exit(int n)
 {
-    time_t now;
-    char ts[30];
-    time(&now);
-    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
-    printf("[%s] [%-6s] %s\n", ts, nivel, msg);
-    fflush(stdout);
+    printf("Cancelled with [%d]\n", n);
+    esp_abort();
+    exit(0);
 }
 
 /* -------------------------------------------------- */
-/* Heartbeat: consulta a tabla real del sistema       */
+/* Heartbeat: un solo registro de panacct             */
+/* Mismo patron exacto que read_card en gentabpan     */
 /* Retorna 0 si OK, -1 si fallo                       */
 /* -------------------------------------------------- */
 static int enviar_heartbeat(int ciclo)
 {
+    char command[600];
+    char logbuf[300];
     ESP_SLOT slot;
     ESP_SLOTP slotp = &slot;
-    char command[300];
-    char sid[20];
-    char status[20];
-    char logbuf[300];
 
-    memset(command, '\0', sizeof(command));
-    memset(sid,     '\0', sizeof(sid));
-    memset(status,  '\0', sizeof(status));
+    memset(command,     '\0', sizeof(command));
+    memset(hb_account,  '\0', sizeof(hb_account));
+    memset(hb_pan,      '\0', sizeof(hb_pan));
 
-    /*
-     * Consulta a V$SESSION usando la sesion actual.
-     * Es la mas representativa porque confirma que la sesion
-     * Oracle sigue activa, no solo el TCP.
-     * Mismo patron que se usa en gentabpan con esp_read/esp_fetch/esp_get.
-     */
+    /* SELECT minimo sobre panacct, mismo filtro que gentabpan */
     sprintf(command,
-        "SELECT SID, STATUS FROM V$SESSION "
-        "WHERE AUDSID = USERENV('SESSIONID') "
+        "SELECT pan, account FROM panacct "
+        "WHERE (pan IS NOT NULL) "
+        "AND pan >= ' ' AND instid >= ' ' AND subinstid >= ' ' AND account >= ' ' "
         "AND ROWNUM = 1");
 
-    if (esp_read(slotp, "heartbeat", command, ESP_LOOK)) {
-        sprintf(logbuf, "Ciclo %d - fallo: %s",
+    cc_send("Heartbeat ciclo %d [%s]\n", ciclo, command);
+
+    if (esp_read(slotp, "card", command, ESP_LOOK))
+    {
+        cc_send("ESP_READ ERROR: [%s]", (char*)*Last_error);
+        fprintf(stderr, "Heartbeat ciclo %d - ESP_READ ERROR: %s\n",
             ciclo, (char*)*Last_error);
-        log_msg("ERROR", logbuf);
         esp_free(slotp);
         return -1;
     }
 
-    if (!esp_fetch(slotp)) {
-        esp_get(slotp, "sid",    sid);
-        esp_get(slotp, "status", status);
-        sprintf(logbuf, "Ciclo %d - sesion activa: SID=%s STATUS=%s",
-            ciclo, sid, status);
-        log_msg("OK", logbuf);
+    while (!esp_fetch(slotp))
+    {
+        esp_get(slotp, "account", hb_account);
+        esp_get(slotp, "pan",     hb_pan);
+
+        time(&now);
+        printf("[%s] [OK    ] Ciclo %d/%d - BD responde OK | account=%.8s...\n",
+            ctime_r(&now, logbuf) ? strtok(logbuf, "\n") : "??:??:??",
+            ciclo, MAX_CICLOS, hb_account);
+        fflush(stdout);
     }
 
     esp_free(slotp);
@@ -95,18 +96,22 @@ static int enviar_heartbeat(int ciclo)
 }
 
 /* -------------------------------------------------- */
-/* Imprime separador visual                           */
+/* Log con timestamp                                  */
 /* -------------------------------------------------- */
-static void separador()
+static void log_msg(const char *nivel, const char *msg)
 {
-    printf("----------------------------------------------\n");
+    time_t n;
+    char ts[30];
+    time(&n);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&n));
+    printf("[%s] [%-6s] %s\n", ts, nivel, msg);
     fflush(stdout);
 }
 
 /* -------------------------------------------------- */
-/* Main                                               */
+/* Main - misma firma que gentabpan                   */
 /* -------------------------------------------------- */
-int main(int argc, char **argv)
+int main(int argc, char **argv, char **env)
 {
     char  *host;
     char  *puerto_str;
@@ -115,9 +120,11 @@ int main(int argc, char **argv)
     int    resultado;
     int    reconexiones = 0;
     char   logbuf[300];
-    time_t t_inicio, t_ahora;
-    char   ts_inicio[30];
+    time_t t_inicio, t_fin;
+    char   str_inicio[30], str_fin[30];
+    double segundos;
 
+    /* Validar argumentos */
     if (argc != 4) {
         printf("Uso: %s <IP> <PUERTO> <INTERVALO_SEGS>\n", argv[0]);
         printf("  Ejemplo: %s 10.34.58.101 4584 300\n", argv[0]);
@@ -135,71 +142,77 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    separador();
-    printf("  simpool - Simulador de Pool Oracle\n");
-    printf("  Destino   : %s:%s\n", host, puerto_str);
-    printf("  Intervalo : %d segundos\n", intervalo);
-    printf("  Max ciclos: %d\n", MAX_CICLOS);
-    printf("  Ctrl+C para salir antes\n");
-    separador();
-    printf("\n");
+    /* Cabecera igual a gentabpan */
+    system("clear");
+    printf("%s\n", " simpool - Simulador de Pool Oracle ");
+    printf("==============================================\n\n");
+    printf("Destino  : %s:%s\n",   host, puerto_str);
+    printf("Intervalo: %d segundos\n", intervalo);
+    printf("Max ciclos: %d\n",     MAX_CICLOS);
+    printf("PID: %d\n\n",          getpid());
 
+    /* Registro de tiempo de inicio */
     time(&t_inicio);
-    strftime(ts_inicio, sizeof(ts_inicio), "%Y-%m-%d %H:%M:%S", localtime(&t_inicio));
+    strftime(str_inicio, sizeof(str_inicio), "%Y-%m-%d %H:%M:%S", localtime(&t_inicio));
+    printf("Inicio: %s\n\n", str_inicio);
 
-    sprintf(logbuf, "Conectando a Oracle %s:%s ...", host, puerto_str);
-    log_msg("INFO", logbuf);
-
+    /* Conectar a Oracle - igual que gentabpan */
+    fep_catch_sig(0, hot_exit);
     sw_logon_database(1);
 
     log_msg("INFO", "Sesion Oracle establecida. Iniciando ciclos de heartbeat.");
-    separador();
+    printf("----------------------------------------------\n");
 
-    while (ciclo <= MAX_CICLOS) {
-
+    /* Loop principal */
+    while (ciclo <= MAX_CICLOS)
+    {
         sprintf(logbuf, "Ciclo %d/%d - conexion idle por %ds...",
             ciclo, MAX_CICLOS, intervalo);
         log_msg("INFO", logbuf);
 
+        /* Conexion queda idle N segundos, igual que el pool real */
         sleep(intervalo);
 
         resultado = enviar_heartbeat(ciclo);
 
-        if (resultado != 0) {
-            time(&t_ahora);
+        if (resultado != 0)
+        {
             sprintf(logbuf,
                 ">>> CONEXION CAIDA ciclo %d/%d | idle=%ds | reconexion #%d",
                 ciclo, MAX_CICLOS, intervalo, ++reconexiones);
             log_msg("ALERTA", logbuf);
 
-            separador();
+            printf("----------------------------------------------\n");
             log_msg("INFO", "Reconectando a Oracle...");
             sw_logon_database(1);
             log_msg("INFO", "Reconexion exitosa. Continuando...");
-            separador();
+            printf("----------------------------------------------\n");
         }
 
         ciclo++;
     }
 
-    time(&t_ahora);
-    printf("\n");
-    separador();
-    printf("  RESUMEN FINAL\n");
-    printf("  Inicio             : %s\n", ts_inicio);
-    {
-        char ts_fin[30];
-        strftime(ts_fin, sizeof(ts_fin), "%Y-%m-%d %H:%M:%S", localtime(&t_ahora));
-        printf("  Fin                : %s\n", ts_fin);
-    }
-    printf("  Ciclos completados : %d\n", MAX_CICLOS);
-    printf("  Intervalo probado  : %d segundos\n", intervalo);
-    printf("  Reconexiones       : %d\n", reconexiones);
+    /* Resumen final - igual a gentabpan */
+    time(&t_fin);
+    strftime(str_fin, sizeof(str_fin), "%Y-%m-%d %H:%M:%S", localtime(&t_fin));
+    segundos = difftime(t_fin, t_inicio);
+
+    printf("\n==============================================\n");
+    printf("            RESUMEN DE EJECUCION              \n");
+    printf("==============================================\n\n");
+    printf("TIEMPOS:\n");
+    printf("  Inicio:              %s\n", str_inicio);
+    printf("  Fin:                 %s\n", str_fin);
+    printf("  Duracion total:      %.0f seg (%.2f min)\n\n", segundos, segundos/60);
+    printf("RESULTADO:\n");
+    printf("  Ciclos completados:  %d\n", MAX_CICLOS);
+    printf("  Intervalo probado:   %d segundos\n", intervalo);
+    printf("  Reconexiones:        %d\n", reconexiones);
     if (reconexiones == 0)
-        printf("  Resultado          : SIN CAIDAS - conexion estable\n");
+        printf("  Estado:              SIN CAIDAS - conexion estable\n");
     else
-        printf("  Resultado          : INESTABLE - revisar red u Oracle\n");
-    separador();
+        printf("  Estado:              INESTABLE - revisar red u Oracle\n");
+    printf("==============================================\n");
 
     return 0;
 }
