@@ -95,6 +95,18 @@ static int conectar(const char *host, int puerto)
         return -1;
     }
 
+    /* Mostrar puerto local efimero asignado por el SO */
+    {
+        struct sockaddr_in local_addr;
+        socklen_t local_len = sizeof(local_addr);
+        if (getsockname(sockfd, (struct sockaddr*)&local_addr, &local_len) == 0) {
+            sprintf(logbuf, "Socket local: %s:%d -> %s:%d",
+                inet_ntoa(local_addr.sin_addr), ntohs(local_addr.sin_port),
+                host, puerto);
+            log_msg("INFO", logbuf);
+        }
+    }
+
     return sockfd;
 }
 
@@ -241,30 +253,3 @@ int main(int argc, char **argv)
     if (sockfd >= 0) close(sockfd);
     return 0;
 }
-
-
-# ==============================================
-# Makefile.simpool
-# Compilacion de simpool para AIX
-#
-# Uso:
-#   make        -> compila
-#   make clean  -> limpia binario
-# ==============================================
-
-CC      = cc
-CFLAGS  = -O2 -q64 -W "l,suppress=1500-010"
-TARGET  = simpool
-SRC     = simpool.c
-
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRC)
-	@echo ""
-	@echo "Compilacion exitosa: ./$(TARGET)"
-	@echo "Uso: ./$(TARGET) <IP> <PUERTO> [INTERVALO]"
-	@echo "Ej:  ./$(TARGET) 10.34.58.101 4584 300"
-
-clean:
-	rm -f $(TARGET)
-
-.PHONY: clean
