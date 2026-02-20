@@ -47,26 +47,35 @@ static void log_msg(const char *nivel, const char *msg)
 }
 
 /* -------------------------------------------------- */
-/* Heartbeat: SELECT minimo para verificar conexion   */
+/* Heartbeat: consulta a tabla real del sistema       */
 /* Retorna 0 si OK, -1 si fallo                       */
 /* -------------------------------------------------- */
 static int enviar_heartbeat(int ciclo)
 {
     ESP_SLOT slot;
     ESP_SLOTP slotp = &slot;
-    char command[200];
-    char resultado[50];
+    char command[300];
+    char sid[20];
+    char status[20];
     char logbuf[300];
 
-    memset(command,   '\0', sizeof(command));
-    memset(resultado, '\0', sizeof(resultado));
+    memset(command, '\0', sizeof(command));
+    memset(sid,     '\0', sizeof(sid));
+    memset(status,  '\0', sizeof(status));
 
+    /*
+     * Consulta a V$SESSION usando la sesion actual.
+     * Es la mas representativa porque confirma que la sesion
+     * Oracle sigue activa, no solo el TCP.
+     * Mismo patron que se usa en gentabpan con esp_read/esp_fetch/esp_get.
+     */
     sprintf(command,
-        "SELECT 'OK-' || TO_CHAR(SYSDATE,'HH24:MI:SS') AS resultado "
-        "FROM DUAL");
+        "SELECT SID, STATUS FROM V$SESSION "
+        "WHERE AUDSID = USERENV('SESSIONID') "
+        "AND ROWNUM = 1");
 
     if (esp_read(slotp, "heartbeat", command, ESP_LOOK)) {
-        sprintf(logbuf, "Ciclo %d - esp_read fallo: %s",
+        sprintf(logbuf, "Ciclo %d - fallo: %s",
             ciclo, (char*)*Last_error);
         log_msg("ERROR", logbuf);
         esp_free(slotp);
@@ -74,8 +83,10 @@ static int enviar_heartbeat(int ciclo)
     }
 
     if (!esp_fetch(slotp)) {
-        esp_get(slotp, "resultado", resultado);
-        sprintf(logbuf, "Ciclo %d - BD responde: %s", ciclo, resultado);
+        esp_get(slotp, "sid",    sid);
+        esp_get(slotp, "status", status);
+        sprintf(logbuf, "Ciclo %d - sesion activa: SID=%s STATUS=%s",
+            ciclo, sid, status);
         log_msg("OK", logbuf);
     }
 
@@ -107,7 +118,6 @@ int main(int argc, char **argv)
     time_t t_inicio, t_ahora;
     char   ts_inicio[30];
 
-    /* Validar argumentos */
     if (argc != 4) {
         printf("Uso: %s <IP> <PUERTO> <INTERVALO_SEGS>\n", argv[0]);
         printf("  Ejemplo: %s 10.34.58.101 4584 300\n", argv[0]);
@@ -125,7 +135,6 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    /* Cabecera */
     separador();
     printf("  simpool - Simulador de Pool Oracle\n");
     printf("  Destino   : %s:%s\n", host, puerto_str);
@@ -138,12 +147,6 @@ int main(int argc, char **argv)
     time(&t_inicio);
     strftime(ts_inicio, sizeof(ts_inicio), "%Y-%m-%d %H:%M:%S", localtime(&t_inicio));
 
-    /*
-     * Conectar a Oracle usando la infraestructura del proyecto.
-     * sw_logon_database toma la configuracion de TNS del entorno
-     * (variables ORACLE_HOME, TNS_ADMIN, etc) igual que cualquier
-     * otro binario del sistema.
-     */
     sprintf(logbuf, "Conectando a Oracle %s:%s ...", host, puerto_str);
     log_msg("INFO", logbuf);
 
@@ -152,25 +155,17 @@ int main(int argc, char **argv)
     log_msg("INFO", "Sesion Oracle establecida. Iniciando ciclos de heartbeat.");
     separador();
 
-    /* Loop principal */
     while (ciclo <= MAX_CICLOS) {
 
         sprintf(logbuf, "Ciclo %d/%d - conexion idle por %ds...",
             ciclo, MAX_CICLOS, intervalo);
         log_msg("INFO", logbuf);
 
-        /* Aqui la conexion queda idle N segundos, igual que el pool real */
         sleep(intervalo);
 
-        /* Intentar heartbeat para ver si la conexion sobrevivio el idle */
         resultado = enviar_heartbeat(ciclo);
 
         if (resultado != 0) {
-            /*
-             * Conexion caida: registrar timestamp y reconectar.
-             * Esto replica exactamente lo que hace el driver cuando
-             * detecta ORA-03135 / ORA-03113 / ORA-03114.
-             */
             time(&t_ahora);
             sprintf(logbuf,
                 ">>> CONEXION CAIDA ciclo %d/%d | idle=%ds | reconexion #%d",
@@ -187,17 +182,15 @@ int main(int argc, char **argv)
         ciclo++;
     }
 
-    /* Resumen final */
     time(&t_ahora);
     printf("\n");
     separador();
     printf("  RESUMEN FINAL\n");
     printf("  Inicio             : %s\n", ts_inicio);
-    printf("  Fin                : ");
     {
         char ts_fin[30];
         strftime(ts_fin, sizeof(ts_fin), "%Y-%m-%d %H:%M:%S", localtime(&t_ahora));
-        printf("%s\n", ts_fin);
+        printf("  Fin                : %s\n", ts_fin);
     }
     printf("  Ciclos completados : %d\n", MAX_CICLOS);
     printf("  Intervalo probado  : %d segundos\n", intervalo);
