@@ -23,6 +23,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
 #include "pt_master.h"
 
 #define MAX_CICLOS 99
@@ -30,13 +31,39 @@
 time_t now;
 extern char *argv0;
 
+/* Flag global para salida limpia */
+volatile int g_salir = 0;
+
 /* -------------------------------------------------- */
-/* Manejo de senal - igual que gentabpan              */
+/* Cierre limpio al recibir Ctrl+C o senales          */
+/* esp_abort() cierra la sesion Oracle correctamente  */
+/* evitando que el socket quede en FIN_WAIT           */
 /* -------------------------------------------------- */
 static void hot_exit(int n)
 {
-    printf("Cancelled with [%d]\n", n);
+    time_t t;
+    char ts[30];
+
+    time(&t);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&t));
+
+    if (n == SIGINT) {
+        printf("\n[%s] [INFO  ] Ctrl+C recibido. Cerrando sesion Oracle...\n", ts);
+    } else {
+        printf("\n[%s] [INFO  ] Senal %d recibida. Cerrando sesion Oracle...\n", ts, n);
+    }
+    fflush(stdout);
+
+    /*
+     * esp_abort() cierra la sesion Oracle de forma ordenada.
+     * Esto permite que el kernel complete correctamente el
+     * handshake de cierre TCP (FIN/ACK) en lugar de dejar
+     * el socket colgado en FIN_WAIT.
+     */
     esp_abort();
+
+    printf("[%s] [INFO  ] Sesion cerrada correctamente. Saliendo.\n", ts);
+    fflush(stdout);
     exit(0);
 }
 
@@ -143,8 +170,17 @@ int main(int argc, char **argv, char **env)
     strftime(str_inicio, sizeof(str_inicio), "%Y-%m-%d %H:%M:%S", localtime(&t_inicio));
     printf("Inicio          : %s\n\n", str_inicio);
 
-    /* Igual que gentabpan */
+    /*
+     * Registrar senales para cierre limpio.
+     * fep_catch_sig registra las senales del framework ESP.
+     * Adicionalmente registramos SIGINT (Ctrl+C) y SIGTERM
+     * directamente con signal() para garantizar el cierre
+     * correcto del socket Oracle.
+     */
     fep_catch_sig(0, hot_exit);
+    signal(SIGINT,  hot_exit);
+    signal(SIGTERM, hot_exit);
+
     sw_logon_database(1);
 
     log_msg("INFO", "Sesion Oracle establecida. Iniciando ciclos de heartbeat.");
@@ -157,7 +193,6 @@ int main(int argc, char **argv, char **env)
             ciclo, MAX_CICLOS, intervalo);
         log_msg("INFO", logbuf);
 
-        /* Conexion queda idle N segundos, igual que el pool real */
         sleep(intervalo);
 
         resultado = enviar_heartbeat(ciclo);
