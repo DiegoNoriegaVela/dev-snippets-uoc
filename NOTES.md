@@ -31,13 +31,19 @@
 time_t now;
 extern char *argv0;
 
-/* Flag global para salida limpia */
-volatile int g_salir = 0;
+/* Flag que activa el heartbeat cuando vence el alarma */
+volatile int g_alarma_vencida = 0;
 
 /* -------------------------------------------------- */
-/* Cierre limpio al recibir Ctrl+C o senales          */
-/* esp_abort() cierra la sesion Oracle correctamente  */
-/* evitando que el socket quede en FIN_WAIT           */
+/* Handler de SIGALRM: marca que vencio el intervalo  */
+/* -------------------------------------------------- */
+static void handler_alarma(int n)
+{
+    g_alarma_vencida = 1;
+}
+
+/* -------------------------------------------------- */
+/* Cierre limpio al recibir Ctrl+C                    */
 /* -------------------------------------------------- */
 static void hot_exit(int n)
 {
@@ -47,21 +53,14 @@ static void hot_exit(int n)
     time(&t);
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&t));
 
-    if (n == SIGINT) {
+    if (n == SIGINT)
         printf("\n[%s] [INFO  ] Ctrl+C recibido. Cerrando sesion Oracle...\n", ts);
-    } else {
+    else
         printf("\n[%s] [INFO  ] Senal %d recibida. Cerrando sesion Oracle...\n", ts, n);
-    }
+
     fflush(stdout);
-
-    /*
-     * esp_abort() cierra la sesion Oracle de forma ordenada.
-     * Esto permite que el kernel complete correctamente el
-     * handshake de cierre TCP (FIN/ACK) en lugar de dejar
-     * el socket colgado en FIN_WAIT.
-     */
+    alarm(0);       /* Cancelar alarma pendiente */
     esp_abort();
-
     printf("[%s] [INFO  ] Sesion cerrada correctamente. Saliendo.\n", ts);
     fflush(stdout);
     exit(0);
@@ -78,6 +77,21 @@ static void log_msg(const char *nivel, const char *msg)
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&n));
     printf("[%s] [%-6s] %s\n", ts, nivel, msg);
     fflush(stdout);
+}
+
+/* -------------------------------------------------- */
+/* Idle preciso usando SIGALRM                        */
+/* A diferencia de sleep(), alarm() no se ve afectado */
+/* por senales internas del framework ESP             */
+/* -------------------------------------------------- */
+static void idle_preciso(int segundos)
+{
+    g_alarma_vencida = 0;
+    alarm(segundos);
+
+    /* Esperar hasta que la alarma dispare */
+    while (!g_alarma_vencida)
+        pause();   /* pause() espera cualquier senal */
 }
 
 /* -------------------------------------------------- */
@@ -170,16 +184,11 @@ int main(int argc, char **argv, char **env)
     strftime(str_inicio, sizeof(str_inicio), "%Y-%m-%d %H:%M:%S", localtime(&t_inicio));
     printf("Inicio          : %s\n\n", str_inicio);
 
-    /*
-     * Registrar senales para cierre limpio.
-     * fep_catch_sig registra las senales del framework ESP.
-     * Adicionalmente registramos SIGINT (Ctrl+C) y SIGTERM
-     * directamente con signal() para garantizar el cierre
-     * correcto del socket Oracle.
-     */
+    /* Registrar senales */
     fep_catch_sig(0, hot_exit);
     signal(SIGINT,  hot_exit);
     signal(SIGTERM, hot_exit);
+    signal(SIGALRM, handler_alarma);   /* Para el idle preciso */
 
     sw_logon_database(1);
 
@@ -193,7 +202,12 @@ int main(int argc, char **argv, char **env)
             ciclo, MAX_CICLOS, intervalo);
         log_msg("INFO", logbuf);
 
-        sleep(intervalo);
+        /*
+         * idle_preciso usa SIGALRM en lugar de sleep().
+         * Garantiza que el heartbeat se ejecute exactamente
+         * a los N segundos sin importar senales del framework.
+         */
+        idle_preciso(intervalo);
 
         resultado = enviar_heartbeat(ciclo);
 
@@ -213,6 +227,9 @@ int main(int argc, char **argv, char **env)
 
         ciclo++;
     }
+
+    /* Cancelar alarma pendiente al terminar */
+    alarm(0);
 
     /* Resumen final igual a gentabpan */
     time(&t_fin);
